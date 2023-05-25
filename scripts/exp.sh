@@ -1,0 +1,1 @@
+python main.py --image "images/corgi_object_2_rgba.png" --blip --workspace corgi -O --vram_O --iters 5000
