@@ -1,9 +1,15 @@
+import random
+
+from diffusers.loaders import AttnProcsLayers
+from diffusers.models.attention_processor import LoRAAttnProcessor
+from diffusers.models.embeddings import TimestepEmbedding
 from transformers import CLIPTextModel, CLIPTokenizer, logging
-from diffusers import AutoencoderKL, UNet2DConditionModel, PNDMScheduler, DDIMScheduler, StableDiffusionPipeline
+from diffusers import AutoencoderKL, UNet2DConditionModel, PNDMScheduler, DDIMScheduler, StableDiffusionPipeline, \
+    DDPMScheduler
 from diffusers.utils.import_utils import is_xformers_available
 from pathlib import Path
 from guidance import parse_version
-
+from contextlib import contextmanager
 # suppress partial model loading warning
 logging.set_verbosity_error()
 
@@ -35,7 +41,16 @@ def seed_everything(seed):
     #torch.backends.cudnn.deterministic = True
     #torch.backends.cudnn.benchmark = True
 
-class StableDiffusion(nn.Module):
+class ToWeightsDType(nn.Module):
+    def __init__(self, module: nn.Module, dtype: torch.dtype):
+        super().__init__()
+        self.module = module
+        self.dtype = dtype
+
+    def forward(self, x):
+        return self.module(x).to(self.dtype)
+
+class StableDiffusionVSD(nn.Module):
     def __init__(self, device, fp16, vram_O, sd_version='2.1', hf_key=None, t_range=[0.02, 0.98]):
         super().__init__()
 
@@ -78,13 +93,60 @@ class StableDiffusion(nn.Module):
             # pipe.enable_model_cpu_offload()
         else:
             pipe.to(device)
-
+        pipe_lora = pipe
         self.vae = pipe.vae
         self.tokenizer = pipe.tokenizer
         self.text_encoder = pipe.text_encoder
         self.unet = pipe.unet
+        self.unet_lora = pipe_lora.unet
 
-        self.scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler", torch_dtype=self.precision_t)
+        # FIXME: hard-coded dims
+        self.camera_embedding = ToWeightsDType(
+            TimestepEmbedding(16, 1280), self.precision_t
+        )
+        self.unet_lora.class_embedding = self.camera_embedding
+
+        # set up LoRA layers
+        lora_attn_procs = {}
+        for name in self.unet_lora.attn_processors.keys():
+            cross_attention_dim = (
+                None
+                if name.endswith("attn1.processor")
+                else self.unet_lora.config.cross_attention_dim
+            )
+            if name.startswith("mid_block"):
+                hidden_size = self.unet_lora.config.block_out_channels[-1]
+            elif name.startswith("up_blocks"):
+                block_id = int(name[len("up_blocks.")])
+                hidden_size = list(reversed(self.unet_lora.config.block_out_channels))[
+                    block_id
+                ]
+            elif name.startswith("down_blocks"):
+                block_id = int(name[len("down_blocks.")])
+                hidden_size = self.unet_lora.config.block_out_channels[block_id]
+
+            lora_attn_procs[name] = LoRAAttnProcessor(
+                hidden_size=hidden_size, cross_attention_dim=cross_attention_dim
+            )
+
+        self.unet_lora.set_attn_processor(lora_attn_procs)
+
+        self.lora_layers = AttnProcsLayers(self.unet_lora.attn_processors)
+        self.lora_layers._load_state_dict_pre_hooks.clear()
+        self.lora_layers._state_dict_hooks.clear()
+
+        # self.scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler", torch_dtype=self.precision_t)
+        self.scheduler = DDPMScheduler.from_pretrained(
+            model_key,
+            subfolder="scheduler",
+            torch_dtype=self.precision_t,
+        )
+        # used to get prediction type later in training
+        self.scheduler_lora = DDPMScheduler.from_pretrained(
+            model_key,
+            subfolder="scheduler",
+            torch_dtype=self.precision_t,
+        )
 
         del pipe
 
@@ -94,7 +156,22 @@ class StableDiffusion(nn.Module):
         self.alphas = self.scheduler.alphas_cumprod.to(self.device) # for convenience
 
         print(f'[INFO] loaded stable diffusion!')
-
+    def forward_unet(
+        self,
+        unet,
+        latents,
+        t,
+        encoder_hidden_states,
+        class_labels = None,
+        cross_attention_kwargs = None,
+    ):
+        return unet(
+            latents,
+            t,
+            encoder_hidden_states=encoder_hidden_states,
+            class_labels=class_labels,
+            cross_attention_kwargs=cross_attention_kwargs,
+        ).sample
     @torch.no_grad()
     def get_text_embeds(self, prompt):
         # prompt: [str]
@@ -104,9 +181,54 @@ class StableDiffusion(nn.Module):
 
         return embeddings
 
+    @contextmanager
+    def disable_unet_class_embedding(self):
+        class_embedding = self.unet.class_embedding
+        try:
+            self.unet.class_embedding = None
+            yield
+        finally:
+            self.unet.class_embedding = class_embedding
+    def train_lora(
+        self,
+        latents,
+        text_embeddings,
+        mvp_mtx,
+    ):
+        B = latents.shape[0]
+        latents = latents.detach()
 
-    def train_step(self, text_embeddings, pred_rgb, guidance_scale=100, as_latent=False, grad_scale=1,
-                   save_guidance_path:Path=None):
+        t = torch.randint(
+            int(self.num_train_timesteps * 0.0),
+            int(self.num_train_timesteps * 1.0),
+            [B],
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        noise = torch.randn_like(latents)
+        noisy_latents = self.scheduler_lora.add_noise(latents, noise, t)
+        if self.scheduler_lora.config.prediction_type == "epsilon":
+            target = noise
+        elif self.scheduler_lora.config.prediction_type == "v_prediction":
+            target = self.scheduler_lora.get_velocity(latents, noise, t)
+        else:
+            raise ValueError(
+                f"Unknown prediction type {self.scheduler_lora.config.prediction_type}"
+            )
+        _, text_embeddings = text_embeddings.chunk(2)  # conditional text embeddings
+        if random.random() < 0.1:
+            mvp_mtx = torch.zeros_like(mvp_mtx)
+        noise_pred = self.forward_unet(
+            self.unet_lora,
+            noisy_latents,
+            t,
+            encoder_hidden_states=text_embeddings,
+            class_labels=mvp_mtx.view(B, -1),
+            cross_attention_kwargs={"scale": 1.0},
+        )
+        return F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
+    def train_step(self, text_embeddings, pred_rgb, mvp_mtx, guidance_scale=7.5, guidance_scale_lora=1.0, as_latent=False, grad_scale=1):
 
         if as_latent:
             latents = F.interpolate(pred_rgb, (64, 64), mode='bilinear', align_corners=False) * 2 - 1
@@ -115,7 +237,7 @@ class StableDiffusion(nn.Module):
             pred_rgb_512 = F.interpolate(pred_rgb, (512, 512), mode='bilinear', align_corners=False)
             # encode image into latents with vae, requires grad!
             latents = self.encode_imgs(pred_rgb_512)
-
+        B = latents.shape[0]
         # timestep ~ U(0.02, 0.98) to avoid very high/low noise level
         t = torch.randint(self.min_step, self.max_step + 1, (latents.shape[0],), dtype=torch.long, device=self.device)
 
@@ -126,63 +248,56 @@ class StableDiffusion(nn.Module):
             latents_noisy = self.scheduler.add_noise(latents, noise, t)
             # pred noise
             latent_model_input = torch.cat([latents_noisy] * 2)
-            tt = torch.cat([t] * 2)
-            noise_pred = self.unet(latent_model_input, tt, encoder_hidden_states=text_embeddings).sample
+            with self.disable_unet_class_embedding():
+                # cross_attention_kwargs = {"scale": 0.0} if self.single_model else None
+                noise_pred_pretrain = self.forward_unet(
+                    self.unet,
+                    latent_model_input,
+                    torch.cat([t] * 2),
+                    encoder_hidden_states=text_embeddings,
+                    cross_attention_kwargs={"scale": 0.0},
+                )
 
-            # perform guidance (high scale from paper!)
-            noise_pred_uncond, noise_pred_pos = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_pos - noise_pred_uncond)
+            noise_pred_est = self.forward_unet(
+                self.unet_lora,
+                latent_model_input,
+                torch.cat([t] * 2),
+                encoder_hidden_states=text_embeddings,
+                class_labels=torch.cat(
+                    [mvp_mtx.view(B, -1), torch.zeros_like(mvp_mtx.view(B, -1))], dim=0
+                ),
+                cross_attention_kwargs={"scale": 1.0},
+            )
 
-        # import kiui
-        # latents_tmp = torch.randn((1, 4, 64, 64), device=self.device)
-        # latents_tmp = latents_tmp.detach()
-        # kiui.lo(latents_tmp)
-        # self.scheduler.set_timesteps(30)
-        # for i, t in enumerate(self.scheduler.timesteps):
-        #     latent_model_input = torch.cat([latents_tmp] * 3)
-        #     noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings)['sample']
-        #     noise_pred_uncond, noise_pred_pos = noise_pred.chunk(2)
-        #     noise_pred = noise_pred_uncond + 10 * (noise_pred_pos - noise_pred_uncond)
-        #     latents_tmp = self.scheduler.step(noise_pred, t, latents_tmp)['prev_sample']
-        # imgs = self.decode_latents(latents_tmp)
-        # kiui.vis.plot_image(imgs)
+            noise_pred_pretrain_uncond, noise_pred_pretrain_text = noise_pred_pretrain.chunk(2)
+            noise_pred_pretrain = noise_pred_pretrain_uncond + guidance_scale * (
+                    noise_pred_pretrain_text - noise_pred_pretrain_uncond
+            )
+            # TODO: more general cases
+            assert self.scheduler.config.prediction_type == "epsilon"
+            if self.scheduler_lora.config.prediction_type == "v_prediction":
+                alphas_cumprod = self.scheduler_lora.alphas_cumprod.to(
+                    device=latents_noisy.device, dtype=latents_noisy.dtype
+                )
+                alpha_t = alphas_cumprod[t] ** 0.5
+                sigma_t = (1 - alphas_cumprod[t]) ** 0.5
+
+                noise_pred_est = latents_noisy * sigma_t + noise_pred_est * alpha_t
+
+            noise_pred_est_uncond, noise_pred_est_text = noise_pred_est.chunk(2)
+            noise_pred_est = noise_pred_est_uncond + guidance_scale_lora * (
+                    noise_pred_est_text - noise_pred_est_uncond
+            )
 
         # w(t), sigma_t^2
         w = (1 - self.alphas[t])
-        grad = grad_scale * w[:, None, None, None] * (noise_pred - noise)
+        grad = grad_scale * w[:, None, None, None] * (noise_pred_pretrain - noise_pred_est)
         grad = torch.nan_to_num(grad)
 
-        if save_guidance_path:
-            with torch.no_grad():
-                if as_latent:
-                    pred_rgb_512 = self.decode_latents(latents)
+        vsd_loss = SpecifyGradient.apply(latents, grad)
+        lora_loss = self.train_lora(latents, text_embeddings, mvp_mtx)
 
-                # visualize predicted denoised image
-                # The following block of code is equivalent to `predict_start_from_noise`...
-                # see zero123_utils.py's version for a simpler implementation.
-                alphas = self.scheduler.alphas.to(latents)
-                total_timesteps = self.max_step - self.min_step + 1
-                index = total_timesteps - t.to(latents.device) - 1 
-                b = len(noise_pred)
-                a_t = alphas[index].reshape(b,1,1,1).to(self.device)
-                sqrt_one_minus_alphas = torch.sqrt(1 - alphas)
-                sqrt_one_minus_at = sqrt_one_minus_alphas[index].reshape((b,1,1,1)).to(self.device)                
-                pred_x0 = (latents_noisy - sqrt_one_minus_at * noise_pred) / a_t.sqrt() # current prediction for x_0
-                result_hopefully_less_noisy_image = self.decode_latents(pred_x0.to(latents.type(self.precision_t)))
-
-                # visualize noisier image
-                result_noisier_image = self.decode_latents(latents_noisy.to(pred_x0).type(self.precision_t))
-
-                # TODO: also denoise all-the-way
-
-                # all 3 input images are [1, 3, H, W], e.g. [1, 3, 512, 512]
-                viz_images = torch.cat([pred_rgb_512, result_noisier_image, result_hopefully_less_noisy_image],dim=0)
-                save_image(viz_images, save_guidance_path)
-
-        # since we omitted an item in grad, we need to use the custom function to specify the gradient
-        loss = SpecifyGradient.apply(latents, grad)
-
-        return loss
+        return vsd_loss+lora_loss
 
     @torch.no_grad()
     def produce_latents(self, text_embeddings, height=512, width=512, num_inference_steps=50, guidance_scale=7.5, latents=None):
@@ -251,36 +366,6 @@ class StableDiffusion(nn.Module):
 
         return imgs
 
-
-if __name__ == '__main__':
-
-    import argparse
-    import matplotlib.pyplot as plt
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('prompt', type=str)
-    parser.add_argument('--negative', default='', type=str)
-    parser.add_argument('--sd_version', type=str, default='2.1', choices=['1.5', '2.0', '2.1'], help="stable diffusion version")
-    parser.add_argument('--hf_key', type=str, default=None, help="hugging face Stable diffusion model key")
-    parser.add_argument('--fp16', action='store_true', help="use float16 for training")
-    parser.add_argument('--vram_O', action='store_true', help="optimization for low VRAM usage")
-    parser.add_argument('-H', type=int, default=512)
-    parser.add_argument('-W', type=int, default=512)
-    parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--steps', type=int, default=50)
-    opt = parser.parse_args()
-
-    seed_everything(opt.seed)
-
-    device = torch.device('cuda')
-
-    sd = StableDiffusion(device, opt.fp16, opt.vram_O, opt.sd_version, opt.hf_key)
-
-    imgs = sd.prompt_to_img(opt.prompt, opt.negative, opt.H, opt.W, opt.steps)
-
-    # visualize image
-    plt.imshow(imgs[0])
-    plt.show()
 
 
 

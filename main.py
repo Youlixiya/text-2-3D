@@ -40,11 +40,15 @@ if __name__ == '__main__':
 
     parser.add_argument('--IF', action='store_true',
                         help="experimental: use DeepFloyd IF as the guidance model for nerf stage")
+    parser.add_argument('--VSD', action='store_true',
+                        help="experimental: use VSD as the loss for nerf training")
     parser.add_argument('--blip', action='store_true',
                         help="use blip to capture image prompt(only use when image is given)")
     parser.add_argument('--guidance', type=str, nargs='*', default=['SD'], help='guidance model')
     parser.add_argument('--guidance_scale', type=float, default=100,
                         help="diffusion model classifier-free guidance scale")
+    parser.add_argument('--guidance_scale_lora', type=float, default=1.0,
+                        help="diffusion model lora guidance scale")
 
     parser.add_argument('--save_mesh', action='store_true', help="export an obj mesh with texture")
     parser.add_argument('--mcubes_resolution', type=int, default=256, help="mcubes resolution for extracting mesh")
@@ -181,8 +185,8 @@ if __name__ == '__main__':
 
     ### GUI options
     parser.add_argument('--gui', action='store_true', help="start a GUI")
-    parser.add_argument('--W', type=int, default=800, help="GUI width")
-    parser.add_argument('--H', type=int, default=800, help="GUI height")
+    parser.add_argument('--W', type=int, default=512, help="GUI width")
+    parser.add_argument('--H', type=int, default=512, help="GUI height")
     parser.add_argument('--radius', type=float, default=5, help="default GUI camera radius from center")
     parser.add_argument('--fovy', type=float, default=20, help="default GUI camera fovy")
     parser.add_argument('--light_theta', type=float, default=60,
@@ -208,6 +212,12 @@ if __name__ == '__main__':
                         help="start iter # for experiment, to calculate progressive_view and progressive_level")
     parser.add_argument('--exp_end_iter', type=int, default=None,
                         help="end iter # for experiment, to calculate progressive_view and progressive_level")
+    parser.add_argument('--max_step_percent_annealed', type=float, default=0.5,
+                        help="when use vsd the max step percent annealed")
+    parser.add_argument('--anneal_start_step', type=int, default=5000,
+                        help="when use vsd anneal start step")
+    parser.add_argument('--camera_condition_type', type=str, default='extrinsics',
+                        help="when use vsd camera condition type")
 
     opt = parser.parse_args()
 
@@ -225,6 +235,12 @@ if __name__ == '__main__':
             opt.guidance.append('IF')
         opt.latent_iter_ratio = 0  # must not do as_latent
         opt.guidance_scale = 20
+    if opt.VSD:
+        if 'SD' in opt.guidance:
+            opt.guidance.remove('SD')
+            opt.guidance.append('vsd')
+        opt.guidance_scale = 7.5
+        opt.guidance_scale_lora = 1.0
 
     opt.images, opt.ref_radii, opt.ref_polars, opt.ref_azimuths, opt.zero123_ws = [], [], [], [], []
     opt.default_zero123_w = 1
@@ -249,7 +265,8 @@ if __name__ == '__main__':
 
         else:
             # use stable-diffusion when providing both text and image
-            opt.guidance = ['SD', 'clip']
+            # opt.guidance = ['SD', 'clip']
+            opt.guidance.append('clip')
             opt.guidance_scale = 10
 
             opt.t_range = [0.2, 0.6]
@@ -431,12 +448,16 @@ if __name__ == '__main__':
             from guidance.zero123_utils import Zero123
 
             guidance['zero123'] = Zero123(device=device, fp16=opt.fp16, config=opt.zero123_config,
-                                          ckpt=opt.zero123_ckpt, vram_O=opt.vram_O, t_range=opt.t_range)
+                                          ckpt=opt.zero123_ckpt, vram_O=opt.vram_O, t_range=opt.t_range, opt=opt)
 
         if 'clip' in opt.guidance:
             from guidance.clip_utils import CLIP
 
             guidance['clip'] = CLIP(device)
+
+        if 'vsd' in opt.guidance:
+            from guidance.vsd_utils import StableDiffusionVSD
+            guidance['vsd'] = StableDiffusionVSD(device, opt.fp16, opt.vram_O, opt.sd_version, opt.hf_key, opt.t_range)
 
         trainer = Trainer(' '.join(sys.argv), 'df', opt, model, guidance, device=device, workspace=opt.workspace,
                           optimizer=optimizer, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler,

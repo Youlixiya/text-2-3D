@@ -234,6 +234,7 @@ class NeRFDataset:
         data = {
             'H': H,
             'W': W,
+            'poses' : poses,
             'rays_o': rays['rays_o'],
             'rays_d': rays['rays_d'],
             'dir': dirs,
@@ -302,6 +303,7 @@ class NeRFDataset:
         data = {
             'H': self.H,
             'W': self.W,
+            'poses' : poses,
             'rays_o': rays['rays_o'],
             'rays_d': rays['rays_d'],
             'dir': dirs,

@@ -57,3 +57,6 @@ debugpy-run
 
 # for deepfloyd if
 sentencepiece
+
+# for webui
+graido

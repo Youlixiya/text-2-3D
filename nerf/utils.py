@@ -304,6 +304,13 @@ class Trainer(object):
             if 'clip' in self.guidance:
                 self.embeddings['clip']['text'] = self.guidance['clip'].get_text_embeds(self.opt.text)
 
+            if 'vsd' in self.guidance:
+                self.embeddings['vsd']['default'] = self.guidance['vsd'].get_text_embeds([self.opt.text])
+                self.embeddings['vsd']['uncond'] = self.guidance['vsd'].get_text_embeds([self.opt.negative])
+
+                for d in ['front', 'side', 'back']:
+                    self.embeddings['vsd'][d] = self.guidance['vsd'].get_text_embeds([f"{self.opt.text}, {d} view"])
+
         if self.opt.images is not None:
 
             h = int(self.opt.known_view_scale * self.opt.h)
@@ -378,6 +385,7 @@ class Trainer(object):
         # perform RGBD loss instead of SDS if is image-conditioned
         do_rgbd_loss = self.opt.images is not None and \
             (self.global_step % self.opt.known_view_interval == 0)
+
 
         # override random camera with fixed known camera
         if do_rgbd_loss:
@@ -595,6 +603,47 @@ class Trainer(object):
 
                 loss = loss + self.guidance['clip'].train_step(self.embeddings['clip'], pred_rgb, grad_scale=lambda_guidance)
 
+            if 'vsd' in self.guidance:
+                # prolificdreamer max_iter annealed
+                if self.global_step > self.opt.anneal_start_step:
+                    self.guidance['vsd'].max_iter = int(
+                    self.guidance['vsd'].num_train_timesteps * self.opt.max_step_percent_annealed)
+                # interpolate text_z
+                azimuth = data['azimuth']  # [-180, 180]
+
+                # ENHANCE: remove loop to handle batch size > 1
+                text_z = [self.embeddings['vsd']['uncond']] * azimuth.shape[0]
+                for b in range(azimuth.shape[0]):
+                    if azimuth[b] >= -90 and azimuth[b] < 90:
+                        if azimuth[b] >= 0:
+                            r = 1 - azimuth[b] / 90
+                        else:
+                            r = 1 + azimuth[b] / 90
+                        start_z = self.embeddings['vsd']['front']
+                        end_z = self.embeddings['vsd']['side']
+                    else:
+                        if azimuth[b] >= 0:
+                            r = 1 - (azimuth[b] - 90) / 90
+                        else:
+                            r = 1 + (azimuth[b] + 90) / 90
+                        start_z = self.embeddings['vsd']['side']
+                        end_z = self.embeddings['vsd']['back']
+                    text_z.append(r * start_z + (1 - r) * end_z)
+                text_z = torch.cat(text_z, dim=0)
+                if self.opt.camera_condition_type == 'extrinsics':
+                    camera_condition = data['poses']
+                    camera_condition[:, 3, 3] = 0.0
+                elif self.opt.camera_condition_type == "mvp":
+                    camera_condition = data["mvp"]
+                else:
+                    raise ValueError(
+                        f"Unknown camera_condition_type {self.opt.camera_condition_type}"
+                    )
+                loss = loss + self.guidance['vsd'].train_step(text_z, pred_rgb, camera_condition, as_latent=as_latent,
+                                                             guidance_scale=self.opt.guidance_scale,
+                                                            guidance_scale_lora = self.opt.guidance_scale_lora,
+                                                             grad_scale=self.opt.lambda_guidance)
+
         # regularizations
         if not self.opt.dmtet:
 
@@ -749,7 +798,7 @@ class Trainer(object):
         self.evaluate_one_epoch(loader, name)
         self.use_tensorboardX = use_tensorboardX
 
-    def test(self, loader, save_path=None, name=None, write_video=True):
+    def test(self, loader, save_path=None, name=None, write_video=True, write_gif=True):
 
         if save_path is None:
             save_path = os.path.join(self.workspace, 'results')
@@ -797,6 +846,9 @@ class Trainer(object):
 
             imageio.mimwrite(os.path.join(save_path, f'{name}_rgb.mp4'), all_preds, fps=25, quality=8, macro_block_size=1)
             imageio.mimwrite(os.path.join(save_path, f'{name}_depth.mp4'), all_preds_depth, fps=25, quality=8, macro_block_size=1)
+        if write_gif:
+            imageio.mimsave(os.path.join(save_path, f'{name}_rgb.gif'), all_preds, duration=2)
+            imageio.mimsave(os.path.join(save_path, f'{name}_depth.gif'), all_preds_depth, duration=2)
 
         self.log(f"==> Finished Test.")
 
