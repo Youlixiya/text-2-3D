@@ -100,10 +100,17 @@ class StableDiffusionVSD(nn.Module):
         self.unet = pipe.unet
         self.unet_lora = pipe_lora.unet
 
+        for p in self.vae.parameters():
+            p.requires_grad_(False)
+        for p in self.unet.parameters():
+            p.requires_grad_(False)
+        for p in self.unet_lora.parameters():
+            p.requires_grad_(False)
+
         # FIXME: hard-coded dims
         self.camera_embedding = ToWeightsDType(
             TimestepEmbedding(16, 1280), self.precision_t
-        )
+        ).to(self.device)
         self.unet_lora.class_embedding = self.camera_embedding
 
         # set up LoRA layers
@@ -127,7 +134,7 @@ class StableDiffusionVSD(nn.Module):
 
             lora_attn_procs[name] = LoRAAttnProcessor(
                 hidden_size=hidden_size, cross_attention_dim=cross_attention_dim
-            )
+            ).to(device)
 
         self.unet_lora.set_attn_processor(lora_attn_procs)
 
@@ -156,6 +163,8 @@ class StableDiffusionVSD(nn.Module):
         self.alphas = self.scheduler.alphas_cumprod.to(self.device) # for convenience
 
         print(f'[INFO] loaded stable diffusion!')
+
+    @torch.cuda.amp.autocast(enabled=False)
     def forward_unet(
         self,
         unet,
@@ -165,13 +174,14 @@ class StableDiffusionVSD(nn.Module):
         class_labels = None,
         cross_attention_kwargs = None,
     ):
+        input_dtype = latents.dtype
         return unet(
-            latents,
-            t,
-            encoder_hidden_states=encoder_hidden_states,
+            latents.to(self.precision_t),
+            t.to(self.precision_t),
+            encoder_hidden_states=encoder_hidden_states.to(self.precision_t),
             class_labels=class_labels,
             cross_attention_kwargs=cross_attention_kwargs,
-        ).sample
+        ).sample.to(input_dtype)
     @torch.no_grad()
     def get_text_embeds(self, prompt):
         # prompt: [str]
@@ -193,7 +203,7 @@ class StableDiffusionVSD(nn.Module):
         self,
         latents,
         text_embeddings,
-        mvp_mtx,
+        camera_condition,
     ):
         B = latents.shape[0]
         latents = latents.detach()
@@ -218,18 +228,18 @@ class StableDiffusionVSD(nn.Module):
             )
         _, text_embeddings = text_embeddings.chunk(2)  # conditional text embeddings
         if random.random() < 0.1:
-            mvp_mtx = torch.zeros_like(mvp_mtx)
+            camera_condition = torch.zeros_like(camera_condition)
         noise_pred = self.forward_unet(
             self.unet_lora,
             noisy_latents,
             t,
             encoder_hidden_states=text_embeddings,
-            class_labels=mvp_mtx.view(B, -1),
+            class_labels=camera_condition.view(B, -1),
             cross_attention_kwargs={"scale": 1.0},
         )
         return F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
-    def train_step(self, text_embeddings, pred_rgb, mvp_mtx, guidance_scale=7.5, guidance_scale_lora=1.0, as_latent=False, grad_scale=1):
-
+    def train_step(self, text_embeddings, pred_rgb, camera_condition, guidance_scale=7.5, guidance_scale_lora=1.0, as_latent=False, grad_scale=1):
+        camera_condition = camera_condition.to(self.device)
         if as_latent:
             latents = F.interpolate(pred_rgb, (64, 64), mode='bilinear', align_corners=False) * 2 - 1
         else:
@@ -264,7 +274,7 @@ class StableDiffusionVSD(nn.Module):
                 torch.cat([t] * 2),
                 encoder_hidden_states=text_embeddings,
                 class_labels=torch.cat(
-                    [mvp_mtx.view(B, -1), torch.zeros_like(mvp_mtx.view(B, -1))], dim=0
+                    [camera_condition.view(B, -1), torch.zeros_like(camera_condition.view(B, -1))], dim=0
                 ),
                 cross_attention_kwargs={"scale": 1.0},
             )
@@ -295,7 +305,7 @@ class StableDiffusionVSD(nn.Module):
         grad = torch.nan_to_num(grad)
 
         vsd_loss = SpecifyGradient.apply(latents, grad)
-        lora_loss = self.train_lora(latents, text_embeddings, mvp_mtx)
+        lora_loss = self.train_lora(latents, text_embeddings, camera_condition)
 
         return vsd_loss+lora_loss
 
@@ -331,15 +341,16 @@ class StableDiffusionVSD(nn.Module):
 
         return imgs
 
+    @torch.cuda.amp.autocast(enabled=False)
     def encode_imgs(self, imgs):
         # imgs: [B, 3, H, W]
-
+        input_dtype = imgs.dtype
         imgs = 2 * imgs - 1
 
-        posterior = self.vae.encode(imgs).latent_dist
+        posterior = self.vae.encode(imgs.to(self.precision_t)).latent_dist
         latents = posterior.sample() * self.vae.config.scaling_factor
 
-        return latents
+        return latents.to(input_dtype)
 
     def prompt_to_img(self, prompts, negative_prompts='', height=512, width=512, num_inference_steps=50, guidance_scale=7.5, latents=None):
 
