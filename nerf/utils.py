@@ -206,9 +206,10 @@ class Trainer(object):
             self.optimizer = optim.Adam(self.model.parameters(), lr=0.001, weight_decay=5e-4) # naive adam
         else:
             self.optimizer = optimizer(self.model)
-        if 'VSD' in self.guidance:
-            lora_layers = torch.nn.ModuleList(self.guidance['VSD'].unet_lora.attn_processors.values())
-            self.optimizer.add_param_group({"params": lora_layers.parameters(), 'lr' : opt.lr})
+        if self.guidance is not None:
+            if 'vsd' in self.guidance.keys():
+                lora_layers = torch.nn.ModuleList(self.guidance['vsd'].unet_lora.attn_processors.values())
+                self.optimizer.add_param_group({"params": lora_layers.parameters(), 'lr' : opt.lr})
         if lr_scheduler is None:
             self.lr_scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda epoch: 1) # fake scheduler
         else:
